@@ -3,6 +3,7 @@ import numpy as np
 import pyaudio
 from yolo import YOLO
 import threading
+from threading import Event
 import time
 
 yolo = YOLO("models/cross-hands-tiny-prn.cfg",
@@ -11,12 +12,14 @@ yolo = YOLO("models/cross-hands-tiny-prn.cfg",
 
 
 class StoppableThread(threading.Thread):
-    def __init__(self, target):
-        super().__init__(target=target)
+    def __init__(self, target, args=()):
+        super().__init__()
+        self._target = target
+        self._args = args
         self._stop_event = threading.Event()
 
     def run(self):
-        self._target(self._stop_event)
+        self._target(*self._args, self._stop_event)
 
     def stop(self):
         self._stop_event.set()
@@ -25,9 +28,9 @@ class StoppableThread(threading.Thread):
         return self._stop_event.is_set()
 
 
-def generate_sine_wave(stop_event, frequency=440.0, sample_rate=44100):
+def generate_sine_wave(stop_event, frequency=440.0, sample_rate=44100, volume=0.5):
     p = pyaudio.PyAudio()
-    volume = 0.5  # range [0.0, 1.0]
+    # range [0.0, 1.0]
     stream = p.open(format=pyaudio.paInt16,
                     channels=1,
                     rate=sample_rate,
@@ -45,9 +48,9 @@ def generate_sine_wave(stop_event, frequency=440.0, sample_rate=44100):
     p.terminate()
 
 
-def generate_saw_wave(stop_event, frequency=440.0, sample_rate=44100):
+def generate_saw_wave(stop_event, frequency=440.0, sample_rate=44100, volume=0.2):
     p = pyaudio.PyAudio()
-    volume = 0.5  # range [0.0, 1.0]
+    # range [0.0, 1.0]
     stream = p.open(format=pyaudio.paInt16,
                     channels=1,
                     rate=sample_rate,
@@ -114,9 +117,11 @@ while rval:
     # display hands
     for detection in results[:hands]:
         id, name, confidence, x, y, w, h = detection
+        area = w * h
         cx = x + (w / 2)
         cy = y + (h / 2)
-
+        sine = False
+        saw = False
         # draw a bounding box rectangle and label on the image
         if x >= 0 and x <= 340:
             color = (0, 255, 255)
@@ -131,19 +136,22 @@ while rval:
             saw = True
             sine = False
 
+        norm_area = area/921600
         if sine:
             if saw_thread and saw_thread.is_alive():
                 saw_thread.stop()
                 saw_thread.join()
             if not sine_thread or not sine_thread.is_alive():
-                sine_thread = StoppableThread(target=generate_sine_wave)
+                sine_thread = StoppableThread(
+                    target=generate_sine_wave)
                 sine_thread.start()
         elif saw:
             if sine_thread and sine_thread.is_alive():
                 sine_thread.stop()
                 sine_thread.join()
             if not saw_thread or not saw_thread.is_alive():
-                saw_thread = StoppableThread(target=generate_saw_wave)
+                saw_thread = StoppableThread(
+                    target=generate_saw_wave)
                 saw_thread.start()
 
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
