@@ -9,8 +9,10 @@ mediapipe = "*"
 tensorflow = "*"
 numpy = "*"
 pyaudio = "*"
+python-osc = "*"
 
 [dev-packages]
+ipykernel = "*"
 
 [requires]
 python_version = "3.11"
