@@ -4,8 +4,11 @@ import pyaudio
 from yolo import YOLO
 import threading
 from threading import Event
+import pygame
+from scipy.signal import butter, lfilter
 import time
-
+import os
+import wave
 yolo = YOLO("models/cross-hands-tiny-prn.cfg",
             "models/cross-hands-tiny-prn.weights", ["hand"])
 # Define your sine and saw wave generation functions here
@@ -14,9 +17,13 @@ piano_mode = False
 filter_mode = False
 oscilator_mode = False
 locked = False
-
-
+record = False
+audio_initialized = False
+stop_audio_playback = False
+active_threads = {}
 stop_event = threading.Event()
+volume_factor = 1.0
+cutoff_frequency = 1000
 
 
 class StoppableThread(threading.Thread):
@@ -36,31 +43,104 @@ class StoppableThread(threading.Thread):
         return self._stop_event.is_set()
 
 
-def generate_sine_wave(degree, sample_rate=44100, volume=0.5):
-    global piano_mode
+def load_audio(file_path):
+    # Load the audio file and return the frames as a numpy array
+    with wave.open(file_path, 'rb') as wf:
+        frames = wf.readframes(wf.getnframes())
+        sample_rate = wf.getframerate()
+        audio_data = np.frombuffer(frames, dtype=np.int16)
+    return audio_data, sample_rate
 
-    frequencies = {1: 391.99543598174927,
-                   2: 440.0,
-                   3: 493.8833012561241,
-                   4: 523.2511306011972,
-                   5: 587.3295358348151,
-                   6: 659.2551138257398,
-                   7: 739.9888454232688,
-                   8: 783.9908719634985}
+
+def start_stream(sample_rate):
+    p = pyaudio.PyAudio()
+    stream = p.open(format=pyaudio.paInt16,
+                    channels=1,
+                    rate=sample_rate,
+                    output=True)
+    return p, stream
+
+
+def butter_lowpass(cutoff, fs, order=5):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return b, a
+
+
+def apply_lowpass_filter(data, cutoff_freq, fs):
+    b, a = butter_lowpass(cutoff_freq, fs)
+    y = lfilter(b, a, data)
+    return y
+
+
+def audio_thread(file_path, sample_rate=44100):
+    global volume_factor, cutoff_frequency
+
+    audio_data, sample_rate = load_audio(file_path)
+    p, stream = start_stream(sample_rate)
+
+    chunk_size = 1024  # or any other suitable size
+    for i in range(0, len(audio_data), chunk_size):
+        # Apply low-pass filter
+        filtered_data = apply_lowpass_filter(
+            audio_data[i:i+chunk_size], cutoff_frequency, sample_rate)
+        # Adjust the volume
+        adjusted_data = (audio_data[i:i+chunk_size]
+                         * volume_factor).astype(np.int16)
+        stream.write(adjusted_data.tobytes())
+
+        if stop_audio_playback:
+            break
+
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+
+
+def generate_sine_wave(degree, sample_rate=44100, volume=0.5):
+    frequencies = {1: 220.0,
+                   2: 246.94165062806206,
+                   3: 277.1826309768721,
+                   4: 293.6647679174076,
+                   5: 329.6275569128699,
+                   6: 369.9944227116344,
+                   7: 415.3046975799451,
+                   8: 440.0}
 
     p = pyaudio.PyAudio()
-    # range [0.0, 1.0]
+
     stream = p.open(format=pyaudio.paInt16,
                     channels=1,
                     rate=sample_rate,
                     output=True)
 
-    # Generate samples
-    samples = (volume * 32767 * np.sin(2 * np.pi * np.arange(sample_rate)
-               * frequencies[degree] / sample_rate)).astype(np.int16)
+    # Duration for attack and decay in seconds
+    attack_duration = 0.3
+    decay_duration = 0.3
 
-    while not stop_event.is_set() and piano_mode:
-        stream.write(samples.tobytes())
+    # Number of samples for attack and decay
+    attack_samples = int(sample_rate * attack_duration)
+    decay_samples = int(sample_rate * decay_duration)
+
+    # Create the attack and decay ramps
+    attack_ramp = np.linspace(0, 1, attack_samples)
+    decay_ramp = np.linspace(1, 0, decay_samples)
+
+    # Generate the sine wave samples
+    samples = np.sin(2 * np.pi * np.arange(sample_rate)
+                     * frequencies[degree] / sample_rate)
+
+    # Apply the attack ramp
+    samples[:attack_samples] *= attack_ramp
+
+    # Apply the decay ramp
+    samples[-decay_samples:] *= decay_ramp
+
+    # Scale to the desired volume and convert to int16
+    samples = (volume * 32767 * samples).astype(np.int16)
+
+    stream.write(samples.tobytes())  # Play the samples
 
     stream.stop_stream()
     stream.close()
@@ -69,15 +149,26 @@ def generate_sine_wave(degree, sample_rate=44100, volume=0.5):
 
 def piano(degree):
 
-    stop_event.clear()
+    global active_threads
+
+    # Check if there's already a running thread for this degree
+    if degree in active_threads and active_threads[degree].is_alive():
+
+        return
+
+    # If not, start a new thread and add it to the dictionary
     thread = threading.Thread(target=generate_sine_wave, args=(degree,))
     thread.start()
+    active_threads[degree] = thread
 
-    return thread
+    # Optional: Clean up finished threads
+    for d in list(active_threads.keys()):
+        if not active_threads[d].is_alive():
+            del active_threads[d]
 
 
 def main():
-    global locked, piano_mode, filter_mode, oscilator_mode, piano_state
+    global locked, piano_mode, filter_mode, oscilator_mode, piano_state, record, audio_initialized, volume_factor, cutoff_frequency, stop_audio_playback
     piano_thread = None
     # Initialize threading variables
     sine_thread = None
@@ -104,6 +195,8 @@ def main():
         # display fps
         cv2.putText(frame, f'{round(1/inference_time,2)} FPS',
                     (15, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+        # display piano
         cv2.rectangle(frame, (0, 0), (340, 720), (0, 255, 255), 2)
         cv2.rectangle(frame, (341, 0), (939, 720), (66, 255, 167), 2)
         cv2.rectangle(frame, (940, 0), (1280, 720), (255, 64, 143), 2)
@@ -120,6 +213,11 @@ def main():
         cv2.rectangle(frame, (940, 585), (1280, 660), (255, 64, 143), 2)
 
         cv2.rectangle(frame, (940, 660), (1280, 720), (0, 0, 0), -1)
+
+        # display samples
+        cv2.rectangle(frame, (0, 60), (340, 135), (255, 255, 200), 2)
+        cv2.putText(frame,  'Miguel_Carballo_Barcarola.mp3',
+                    (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 255, 255), 2)
 
         # sort by confidence
         results.sort(key=lambda x: x[2])
@@ -141,6 +239,9 @@ def main():
                     # piano_thread.join()
                     stop_event.set()
                     piano_state = "stopped"
+                if audio_initialized:
+                    stop_audio_playback = True
+                    audio_initialized = False
 
                 if cx > 940:
                     piano_mode = True
@@ -190,8 +291,52 @@ def main():
                 overlay = frame.copy()
                 # Draw a rectangle on the overlay
                 cv2.rectangle(overlay, (0, 0), (939, 720), (0, 0, 0), -1)
-                # Define the opacity factor (between 0 and 1)
                 alpha = 0.5  # For 50% opacity
+                # Blend the overlay with the original frame
+                cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+                # Check if recording
+                if record:
+                    # Position for the circle (e.g., top-right corner)
+                    # 50 pixels from the right edge
+                    circle_x = frame.shape[1] - 50
+                    circle_y = 50  # 50 pixels from the top edge
+                    radius = 20  # Circle radius
+                    color = (0, 0, 255)  # Red color in BGR
+                    thickness = -1  # Negative thickness makes the circle filled
+
+    # Draw a red circle to indicate recording
+                    cv2.circle(frame, (circle_x, circle_y),
+                               radius, color, thickness)
+
+            elif locked and filter_mode:
+                stop_audio_playback = False
+                # play "lib/img/audio/Miguel_Carballo_Barcarola.mp3" in a thread
+                # the frame has a size of 1280 X 720.
+                # consider top right to be highpass filter
+                # bottom right is low pass
+                # top left is band pass but in the higher frequency range
+                # bottom left is the band pass but in the lower freq range
+                # map the this to filter the audio file using the variables
+                # cx and cy hold the hands center value.
+                #
+                volume_factor = 1-(cy / 720)
+                cutoff_frequency = 500 + (cx / 1280) * 2500
+                if not audio_initialized:
+                    threading.Thread(target=audio_thread, args=(
+                        "lib/img/audio/Miguel_Carballo_Barcarola.wav",)).start()
+                    audio_initialized = True
+
+        # Write adjusted data to stream
+
+                overlay = frame.copy()
+                # Draw a rectangle on the overlay
+                cv2.rectangle(overlay, (0, 0), (340, 720),
+                              (255, 255, 128), -1)
+                cv2.rectangle(overlay, (939, 0), (1280, 720),
+                              (255, 255, 128), -1)
+                # Define the opacity factor (between 0 and 1)
+                alpha = 0.2  # For 50% opacity
                 # Blend the overlay with the original frame
                 cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
@@ -203,6 +348,8 @@ def main():
 
         if key == 32:  # Spacebar key code
             locked = not locked  # Toggle the state
+        if key == 114:
+            record = not record
 
         if key == 27:  # exit on ESC
             break

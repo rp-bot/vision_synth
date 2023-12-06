@@ -10,6 +10,8 @@ tensorflow = "*"
 numpy = "*"
 pyaudio = "*"
 python-osc = "*"
+scipy = "*"
+pygame = "*"
 
 [dev-packages]
 ipykernel = "*"
